@@ -1,15 +1,11 @@
 # VERSION CHANGELOG
 
-## version number major.minor.patch
-## date of release dd-mm-yyyy
+## [1.1.0] - 2026-08-25
 
-Document release changes under the following categories:
+### Fixes
 
+- Renamed `CHANGELIOG.MD` to `CHANGELOG.md` (typo fix) (#7).
 
-## Fixes
+### Changes
 
-- Bug fixes.
-
-## Changes
-
-- New features and workflows.
+- Initial project structure with GitHub OIDC Terraform template.
