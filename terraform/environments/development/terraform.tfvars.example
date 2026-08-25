@@ -1,0 +1,9 @@
+# Copy this file to terraform.tfvars for local testing.
+# Replace placeholders with non-secret environment values.
+# Do not commit terraform.tfvars.
+
+oidc_role_arn = "<YOUR_DEVELOPMENT_ROLE_ARN>"
+cloud_account_id = "<YOUR_AWS_ACCOUNT_ID>"
+state_bucket = "terraform-aws-github-oidc-s3-bucket-example-dev"
+state_key = "terraform/development/terraform.tfstate"
+cloud_region = "us-east-1"

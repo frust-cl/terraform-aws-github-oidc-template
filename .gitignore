@@ -1,8 +1,19 @@
-.env
-.env.*
-!.env.example
-__pycache__/
-*.pyc
-.venv/
-venv/
-.DS_Store
+# Terraform working directory
+.terraform/
+
+# Terraform state and crash data
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Variable files can contain sensitive values
+*.tfvars
+!*.tfvars.example
+
+# Local Terraform plans
+*.tfplan
+
+# Terraform dependency lock files are normally committed.
+# Uncomment the next line only when local lock files must stay untracked.
+# .terraform.lock.hcl

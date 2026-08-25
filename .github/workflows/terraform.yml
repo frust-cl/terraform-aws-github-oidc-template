@@ -1,0 +1,134 @@
+name: Terraform
+
+# Plan runs on every pull request and on every push to a deployment branch.
+# Apply runs only on a push, and only after the plan job succeeds.
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - main
+      - develop
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.15.9"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    # A pull request reads its target branch. A push reads the pushed branch.
+    # The `-plan` environment carries a read-only role and has no reviewers, so
+    # the plan never waits for approval.
+    environment: ${{ (github.base_ref || github.ref_name) == 'main' && 'production-plan' || 'development-plan' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Resolve target environment
+        id: target
+        run: |
+          if [ "${{ github.base_ref || github.ref_name }}" = "main" ]; then
+            echo "name=production" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=development" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          # Environment-scoped secret. The value differs per environment.
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          role-session-name: github-plan-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        run: terraform init -input=false
+
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        # Exit code 0 means no changes. Exit code 2 means changes are pending.
+        # Both are success. Only a real error fails the job.
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: terraform-plan-${{ steps.target.outputs.name }}
+          path: terraform/environments/${{ steps.target.outputs.name }}/tfplan
+          if-no-files-found: error
+          retention-days: 7
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    # `needs` orders the jobs. Apply never starts before the plan succeeds.
+    needs: plan
+    # This environment carries the apply role and the required reviewers.
+    environment: ${{ github.ref_name == 'main' && 'production' || 'development' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Resolve target environment
+        id: target
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "name=production" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=development" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Terraform plan
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: terraform-plan-${{ steps.target.outputs.name }}
+          path: terraform/environments/${{ steps.target.outputs.name }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          # Environment-scoped secret. The value differs per environment.
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
+          role-session-name: github-apply-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        run: terraform init -input=false
+
+      - name: Terraform Apply saved plan
+        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        run: terraform apply -input=false tfplan
+
+      - name: Deploy site content to S3
+        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        run: |
+          BUCKET=$(terraform output -raw site_bucket_name)
+          aws s3 sync ../../../site "s3://${BUCKET}" --delete
+
+      - name: Invalidate CloudFront cache
+        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        run: |
+          DIST_ID=$(terraform output -raw cloudfront_distribution_id)
+          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*"
