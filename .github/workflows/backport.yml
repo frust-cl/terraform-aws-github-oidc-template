@@ -1,0 +1,192 @@
+name: "Backport main to develop"
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Number of the merged hotfix/release PR on main to backport"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Only one main -> develop PR can be open at a time, so runs must not race.
+concurrency:
+  group: backport-main-to-develop
+  cancel-in-progress: false
+
+jobs:
+  backport:
+    name: "Open main -> develop pull request"
+    runs-on: ubuntu-latest
+
+    # Only merged (not just closed) PRs from a hotfix/ or release/ branch.
+    # workflow_dispatch skips this gate; the resolve step below re-validates
+    # the PR it is given.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+      (startsWith(github.event.pull_request.head.ref, 'hotfix/') ||
+       startsWith(github.event.pull_request.head.ref, 'release/')))
+
+    steps:
+      - name: Resolve the hotfix/release pull request
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR: ${{ github.event.inputs.pr_number }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            PR_NUMBER="$INPUT_PR"
+          else
+            PR_NUMBER="$EVENT_PR"
+          fi
+
+          # Read everything from the API so manual runs and event runs agree.
+          PR_JSON=$(gh pr view "$PR_NUMBER" --json number,title,headRefName,baseRefName,mergedAt)
+          HEAD_REF=$(printf '%s' "$PR_JSON" | jq -r '.headRefName')
+          BASE_REF=$(printf '%s' "$PR_JSON" | jq -r '.baseRefName')
+          MERGED_AT=$(printf '%s' "$PR_JSON" | jq -r '.mergedAt // empty')
+          TITLE=$(printf '%s' "$PR_JSON" | jq -r '.title')
+
+          if [ -z "$MERGED_AT" ]; then
+            echo "::error::PR #${PR_NUMBER} is not merged - nothing to backport."
+            exit 1
+          fi
+
+          if [ "$BASE_REF" != "main" ]; then
+            echo "::error::PR #${PR_NUMBER} targeted '${BASE_REF}', not 'main'."
+            exit 1
+          fi
+
+          case "$HEAD_REF" in
+            hotfix/*|release/*) ;;
+            *)
+              echo "::error::PR #${PR_NUMBER} came from '${HEAD_REF}', which is not a 'hotfix/' or 'release/' branch."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "number=${PR_NUMBER}"
+            echo "head_ref=${HEAD_REF}"
+            echo "title<<PR_TITLE_EOF"
+            echo "${TITLE}"
+            echo "PR_TITLE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "PR #${PR_NUMBER} (${HEAD_REF}) is merged into main."
+
+      - name: Check whether main is ahead of develop
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+
+          if ! gh api "repos/${GH_REPO}/branches/develop" >/dev/null 2>&1; then
+            echo "::error::Branch 'develop' does not exist - nothing to backport into."
+            exit 1
+          fi
+
+          # base...head: how far 'main' has moved past 'develop'.
+          COMPARE=$(gh api "repos/${GH_REPO}/compare/develop...main")
+          AHEAD=$(printf '%s' "$COMPARE" | jq -r '.ahead_by')
+
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "needs_pr=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::develop already contains everything on main - nothing to backport."
+            echo "\`develop\` already contains everything on \`main\`. Nothing to backport." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          COMMITS=$(printf '%s' "$COMPARE" \
+            | jq -r '.commits[] | "- \(.sha[0:7]) \(.commit.message | split("\n")[0])"' \
+            | tail -n 50)
+
+          {
+            echo "needs_pr=true"
+            echo "ahead=${AHEAD}"
+            echo "commits<<COMMITS_EOF"
+            echo "${COMMITS}"
+            echo "COMMITS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "main is ${AHEAD} commit(s) ahead of develop."
+
+      - name: Open or update the main -> develop pull request
+        if: steps.compare.outputs.needs_pr == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          AHEAD: ${{ steps.compare.outputs.ahead }}
+          COMMITS: ${{ steps.compare.outputs.commits }}
+        run: |
+          set -euo pipefail
+
+          BODY=$(printf '%s\n' \
+            "Syncs **main** back into **develop** after PR #${PR_NUMBER} (\`${HEAD_REF}\`)." \
+            "" \
+            "\`main\` is ${AHEAD} commit(s) ahead of \`develop\`:" \
+            "" \
+            "${COMMITS}" \
+            "" \
+            "### How to merge" \
+            "" \
+            "Use a **merge commit**. Squashing rewrites the history and \`develop\` would keep looking out of sync with \`main\`, so this workflow would open the same PR again on the next hotfix/release." \
+            "" \
+            "### If GitHub reports conflicts" \
+            "" \
+            "Do **not** use the \"Resolve conflicts\" button. On this PR the head branch is \`main\`, so the web editor would commit the resolution straight to production. Resolve locally instead:" \
+            "" \
+            '```bash' \
+            "git switch develop && git pull" \
+            "git merge origin/main" \
+            "# fix conflicts, then:" \
+            "git push" \
+            '```' \
+            "" \
+            "Pushing the merge closes this PR automatically." \
+            "" \
+            "---" \
+            "Opened automatically by the \`Backport main to develop\` workflow.")
+
+          # head is always 'main', so at most one of these PRs can be open.
+          EXISTING=$(gh pr list \
+            --base develop \
+            --head main \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --body "$BODY"
+            gh pr comment "$EXISTING" \
+              --body "PR #${PR_NUMBER} (\`${HEAD_REF}\`) was merged into \`main\` and is included in this backport."
+            PR_URL=$(gh pr view "$EXISTING" --json url --jq .url)
+            echo "::notice::Updated existing backport PR #${EXISTING}"
+          else
+            PR_URL=$(gh pr create \
+              --base develop \
+              --head main \
+              --title "chore(backport): sync main into develop (#${PR_NUMBER})" \
+              --body "$BODY")
+            echo "::notice::Opened backport PR ${PR_URL}"
+          fi
+
+          echo "Backport PR ready: ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"

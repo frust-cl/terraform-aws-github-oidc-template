@@ -1,0 +1,128 @@
+name: Kiro Custom Code Review
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  kiro-review:
+    # Skip forked pull requests and backport/release source branches.
+    if: github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.head_ref, 'backport/') && !startsWith(github.head_ref, 'release/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Kiro CLI
+        env:
+          # Update this hash only after reviewing a deliberate installer change.
+          KIRO_INSTALLER_SHA256: "91a21bfa05cd7b58601cb83e0f1f187a9d0084726e5b824d4a4cf60306250908"
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cli.kiro.dev/install -o kiro-install.sh
+          echo "$KIRO_INSTALLER_SHA256  kiro-install.sh" | sha256sum --check --status
+          bash kiro-install.sh
+          rm -f kiro-install.sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare review diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff --no-ext-diff "$BASE_SHA...$HEAD_SHA" > .kiro-review-diff.patch
+          test -s .kiro-review-diff.patch
+
+      - name: Run Custom Code Review
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+          KIRO_LOG_NO_COLOR: 1
+        run: |
+          kiro-cli chat \
+            --agent code-reviewer \
+            --no-interactive \
+            --trust-tools=read,grep \
+            "Read .kiro-review-diff.patch and review the changed lines." \
+            > review.raw
+
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          raw = Path("review.raw").read_text()
+          ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+          raw = ansi_escape.sub("", raw).replace("\r", "")
+          decoder = json.JSONDecoder()
+
+          for index, character in enumerate(raw):
+              if character != "{":
+                  continue
+
+              try:
+                  candidate, _ = decoder.raw_decode(raw[index:])
+              except json.JSONDecodeError:
+                  continue
+
+              if isinstance(candidate, dict) and isinstance(candidate.get("findings"), list):
+                  Path("review.json").write_text(json.dumps(candidate))
+                  break
+          else:
+              print("Kiro did not return a JSON object with a findings array.")
+              print(raw)
+              raise SystemExit(1)
+          PY
+
+          cat review.json
+
+      - name: Validate Review Output
+        run: |
+          jq -e '
+            type == "object" and
+            (.findings | type == "array") and
+            all(.findings[];
+              (.severity == "critical" or .severity == "warning" or .severity == "suggestion") and
+              (.path | type == "string") and
+              (.line | type == "number") and
+              (.line == (.line | floor)) and
+              (.line >= 1) and
+              (.body | type == "string") and
+              (.body | length > 0)
+            )
+          ' review.json
+
+      - name: Publish Inline Review Comments
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if jq -e '.findings | length > 0' review.json >/dev/null; then
+            jq -c '.findings[]' review.json | while IFS= read -r finding; do
+              severity=$(jq -r '.severity' <<< "$finding")
+              path=$(jq -r '.path' <<< "$finding")
+              line=$(jq -r '.line' <<< "$finding")
+              message=$(jq -r '.body' <<< "$finding")
+              body=$(printf '**Kiro %s**\n\n%s' "$(printf '%s' "$severity" | tr '[:lower:]' '[:upper:]')" "$message")
+
+              gh api \
+                --method POST \
+                -H 'Accept: application/vnd.github+json' \
+                "/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/comments" \
+                -f body="$body" \
+                -f commit_id="$HEAD_SHA" \
+                -f path="$path" \
+                -F line="$line" \
+                -f side=RIGHT
+            done
+          else
+            echo "No review findings to publish."
+          fi

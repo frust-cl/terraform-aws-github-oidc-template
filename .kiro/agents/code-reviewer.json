@@ -1,0 +1,15 @@
+{
+  "name": "code-reviewer",
+  "description": "Read-only code review agent for the Frust onboarding repository",
+  "prompt": "Read .kiro-review-diff.patch and .kiro/agents/review-rules.md first. Review only the changed lines in the patch. Do not modify files. Return JSON only, with no Markdown fences, using the schema defined in review-rules.md.",
+  "tools": [
+    "read",
+    "grep"
+  ],
+  "allowedTools": [
+    "read",
+    "grep"
+  ],
+  "resources": [],
+  "hooks": {}
+}
