@@ -58,6 +58,66 @@ resource "aws_cloudfront_origin_access_control" "site" {
   signing_protocol                  = "sigv4"
 }
 
+# --- CloudFront Response Headers Policy ---
+#
+# Sets the security headers a static site cannot set for itself, since there is
+# no origin application to emit them.
+#
+# The CSP allows inline styles because the page carries a `<style>` block and
+# `style=` attributes. Moving that CSS into an external file would let
+# `'unsafe-inline'` be dropped. Scripts are blocked outright: the page has no
+# JavaScript, so `script-src 'none'` costs nothing and removes the XSS vector.
+
+resource "aws_cloudfront_response_headers_policy" "site" {
+  name    = "${local.prefix}-security-headers"
+  comment = "Security headers for the Frustie static site"
+
+  security_headers_config {
+    strict_transport_security {
+      access_control_max_age_sec = 31536000
+      include_subdomains         = true
+      preload                    = true
+      override                   = true
+    }
+
+    content_security_policy {
+      content_security_policy = join("; ", [
+        "default-src 'self'",
+        "script-src 'none'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com",
+        "img-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+        "upgrade-insecure-requests"
+      ])
+      override = true
+    }
+
+    content_type_options {
+      override = true
+    }
+
+    frame_options {
+      frame_option = "DENY"
+      override     = true
+    }
+
+    referrer_policy {
+      referrer_policy = "strict-origin-when-cross-origin"
+      override        = true
+    }
+
+    xss_protection {
+      protection = true
+      mode_block = true
+      override   = true
+    }
+  }
+}
+
 # --- CloudFront Function (index.html routing) ---
 
 resource "aws_cloudfront_function" "rewrite" {
@@ -99,12 +159,10 @@ resource "aws_cloudfront_distribution" "site" {
     viewer_protocol_policy = "redirect-to-https"
     compress               = true
 
-    forwarded_values {
-      query_string = false
-      cookies {
-        forward = "none"
-      }
-    }
+    # Managed cache policy. Replaces the deprecated `forwarded_values` block,
+    # which cannot be combined with a cache policy.
+    cache_policy_id            = data.aws_cloudfront_cache_policy.caching_optimized.id
+    response_headers_policy_id = aws_cloudfront_response_headers_policy.site.id
 
     function_association {
       event_type   = "viewer-request"
@@ -150,3 +208,7 @@ resource "aws_s3_bucket_policy" "site" {
 # --- Data sources ---
 
 data "aws_caller_identity" "current" {}
+
+data "aws_cloudfront_cache_policy" "caching_optimized" {
+  name = "Managed-CachingOptimized"
+}
