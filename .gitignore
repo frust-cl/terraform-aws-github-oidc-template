@@ -17,3 +17,7 @@ crash.*.log
 # Terraform dependency lock files are normally committed.
 # Uncomment the next line only when local lock files must stay untracked.
 # .terraform.lock.hcl
+
+# OS metadata
+.DS_Store
+Thumbs.db
