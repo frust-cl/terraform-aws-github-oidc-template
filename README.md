@@ -78,22 +78,3 @@ The pipeline uses a separate OIDC identity and state location for each environme
 ├── README.md
 └── .gitignore
 ```
-
-## Quickstart
-
-1. Read `docs/prerequisites.md`, or ask an agent to read `docs/agent-setup-guide.md` and follow it with you.
-2. Create the OIDC identity provider and one identity for each environment.
-3. Create separate remote state locations for production and development.
-4. Store every secret from the table above in all four GitHub environments.
-5. Replace all `<YOUR_...>` placeholders in the `terraform/` directory.
-6. Review the generated Terraform files and add your infrastructure resources.
-7. Commit the scaffold and open a pull request for a Terraform plan.
-8. Merge into `develop` for development or `main` for production apply.
-9. Approve the apply job in the matching deployment environment.
-
-## Safety requirements
-
-- Store credentials in the CI/CD platform or a cloud secrets manager.
-- Do not commit passwords, API keys, access tokens, or state files.
-- Scope each OIDC trust policy to `frust-cl/terraform-aws-github-oidc-template` and its branch.
-- Grant only the permissions required by the Terraform resources.
