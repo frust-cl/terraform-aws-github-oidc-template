@@ -20,7 +20,7 @@ Replace every `<YOUR_...>` value in the `terraform/` directory before you run th
 
 | Placeholder | Description | Environment |
 |---|---|---|
-| `revi-cl/terraform-aws-github-oidc-template` | Full repository path used by the OIDC trust policy | All |
+| `frust-cl/terraform-aws-github-oidc-template` | Full repository path used by the OIDC trust policy | All |
 | `terraform-aws-github-oidc-s3-bucket-example-prod` | Remote state location for production | production |
 | `terraform-aws-github-oidc-s3-bucket-example-dev` | Remote state location for development | development |
 | `us-east-1` | AWS region for both environments | All |
@@ -95,5 +95,5 @@ The pipeline uses a separate OIDC identity and state location for each environme
 
 - Store credentials in the CI/CD platform or a cloud secrets manager.
 - Do not commit passwords, API keys, access tokens, or state files.
-- Scope each OIDC trust policy to `revi-cl/terraform-aws-github-oidc-template` and its branch.
+- Scope each OIDC trust policy to `frust-cl/terraform-aws-github-oidc-template` and its branch.
 - Grant only the permissions required by the Terraform resources.
