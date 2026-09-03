@@ -108,7 +108,15 @@ jobs:
       - name: Terraform Plan
         working-directory: terraform/environments/${{ env.TF_ENV }}
         # The plan file stays on the runner. Nothing uploads it.
-        run: terraform plan -input=false -out=tfplan
+        #
+        # stdout is discarded on purpose. `terraform plan` prints the whole diff,
+        # and that text carries attribute values such as the AWS account ID. A
+        # workflow log is world-readable on a public repository, exactly like an
+        # artifact, so the log is not a safe place for it. The redacted summary
+        # in the next step is the published view.
+        #
+        # Failures still appear. Terraform writes diagnostics to stderr.
+        run: terraform plan -input=false -out=tfplan > /dev/null
 
       - name: Publish redacted plan summary
         working-directory: terraform/environments/${{ env.TF_ENV }}
@@ -172,7 +180,10 @@ jobs:
         working-directory: terraform/environments/${{ env.TF_ENV }}
         # The saved plan feeds the apply step below. The file never leaves this
         # runner, so it needs no artifact and no bucket.
-        run: terraform plan -input=false -out=tfplan
+        #
+        # stdout is discarded for the same reason as in the plan job: a public
+        # workflow log must not carry the plan text.
+        run: terraform plan -input=false -out=tfplan > /dev/null
 
       - name: Publish redacted plan summary
         working-directory: terraform/environments/${{ env.TF_ENV }}
@@ -196,16 +207,23 @@ jobs:
 
       - name: Terraform Apply saved plan
         working-directory: terraform/environments/${{ env.TF_ENV }}
-        run: terraform apply -input=false tfplan
+        # stdout lists every resource with its attribute values. The redacted
+        # summary above already records what this step changes.
+        run: terraform apply -input=false tfplan > /dev/null
 
       - name: Deploy site content to S3
         working-directory: terraform/environments/${{ env.TF_ENV }}
         run: |
           BUCKET=$(terraform output -raw site_bucket_name)
-          aws s3 sync ../../../site "s3://${BUCKET}" --delete
+          # The bucket name embeds the AWS account ID, and `aws s3 sync` prints
+          # the full s3:// URI for every object it copies. `--only-show-errors`
+          # keeps that out of the public log without hiding a real failure.
+          aws s3 sync ../../../site "s3://${BUCKET}" --delete --only-show-errors
 
       - name: Invalidate CloudFront cache
         working-directory: terraform/environments/${{ env.TF_ENV }}
         run: |
           DIST_ID=$(terraform output -raw cloudfront_distribution_id)
-          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*"
+          # Print the status only. The full response echoes the distribution ID.
+          aws cloudfront create-invalidation --distribution-id "$DIST_ID" \
+            --paths "/*" --query 'Invalidation.Status' --output text
