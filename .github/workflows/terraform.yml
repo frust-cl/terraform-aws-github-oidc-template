@@ -1,7 +1,56 @@
 name: Terraform
 
-# Plan runs on every pull request and on every push to a deployment branch.
-# Apply runs only on a push, and only after the plan job succeeds.
+# Every action below is pinned to a full commit SHA, not to a tag. A tag is
+# mutable: the owner can move it to different code at any time. This workflow
+# holds `id-token: write`, so a moved tag would hand an AWS role to whoever
+# moved it. A commit SHA cannot change.
+#
+# The trailing comment records the human-readable version. Update the SHA and
+# the comment together. Dependabot reads this form and bumps both.
+
+# Plan runs on a pull request. Deploy runs on a push to a deployment branch.
+# The two jobs never run together, because one event triggers only one of them.
+#
+# ---------------------------------------------------------------------------
+# WHY THE DEPLOY JOB PLANS AND APPLIES IN THE SAME JOB
+# ---------------------------------------------------------------------------
+#
+# The stronger design splits the work: one job saves a plan with
+# `terraform plan -out=tfplan`, and a second gated job runs
+# `terraform apply tfplan`. Terraform then applies exactly the plan the reviewer
+# read, or it refuses to run. That refusal is the whole value of a saved plan.
+#
+# That design needs the plan file to travel between two jobs. The only built-in
+# transport is a workflow artifact. Any person can download an artifact from a
+# public repository, and a plan file holds every resource attribute, including
+# the AWS account ID and any sensitive value. This repository is public, so the
+# artifact is not an option here.
+#
+# A private transport does work. Write the plan to the Terraform state bucket
+# under a run-scoped key, then read it back in the apply job:
+#
+#   aws s3 cp tfplan "s3://${STATE_BUCKET}/plans/${RUN_ID}-${ATTEMPT}.tfplan" \
+#     --sse AES256
+#
+# That keeps the exact guarantee and publishes nothing. It also adds an S3
+# prefix, a lifecycle rule to expire old plans, an extra `s3:PutObject` grant on
+# the plan role, and a variable for the bucket name. Choose that route for a
+# real production pipeline. This template stays simple instead, so the deploy
+# job plans and applies back to back and the plan file never leaves the runner.
+#
+# Note that the deploy job still uses `-out=tfplan` and still runs
+# `terraform apply tfplan`. Apply therefore executes the plan produced seconds
+# earlier in the same job, not a fresh plan.
+#
+# ---------------------------------------------------------------------------
+# THE TRADE-OFF, STATED PLAINLY
+# ---------------------------------------------------------------------------
+#
+# The reviewer approves the deployment before the deploy job produces its plan.
+# The reviewer therefore relies on the plan that the pull request published.
+# The two plans match unless somebody changed AWS outside this pipeline between
+# the approval and the run. Read the plan on the pull request before you
+# approve, and treat an out-of-band change as the risk it is.
 on:
   pull_request:
     branches:
@@ -24,25 +73,21 @@ jobs:
   plan:
     name: Terraform Plan
     runs-on: ubuntu-latest
-    # A pull request reads its target branch. A push reads the pushed branch.
-    # The `-plan` environment carries a read-only role and has no reviewers, so
-    # the plan never waits for approval.
-    environment: ${{ (github.base_ref || github.ref_name) == 'main' && 'production-plan' || 'development-plan' }}
+    if: github.event_name == 'pull_request'
+    # A pull request reads its target branch. The `-plan` environment carries a
+    # read-only role and has no reviewer, so the plan never waits for approval.
+    environment: ${{ github.base_ref == 'main' && 'production-plan' || 'development-plan' }}
+    env:
+      # Resolved by expression, not by a shell command. A branch name reaches a
+      # `run:` block as raw text, so shell interpolation of a ref is a script
+      # injection pattern. This form has no shell to inject into.
+      TF_ENV: ${{ github.base_ref == 'main' && 'production' || 'development' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Resolve target environment
-        id: target
-        run: |
-          if [ "${{ github.base_ref || github.ref_name }}" = "main" ]; then
-            echo "name=production" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=development" >> "$GITHUB_OUTPUT"
-          fi
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6.2.3
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           # Environment-scoped secret. The value differs per environment.
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
@@ -50,57 +95,71 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4.0.1
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ env.TF_VERSION }}
+          # The wrapper rewrites stdout. `terraform show -json` must stay clean.
+          terraform_wrapper: false
 
       - name: Terraform Init
-        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        working-directory: terraform/environments/${{ env.TF_ENV }}
         run: terraform init -input=false
 
       - name: Terraform Plan
-        working-directory: terraform/environments/${{ steps.target.outputs.name }}
-        # Exit code 0 means no changes. Exit code 2 means changes are pending.
-        # Both are success. Only a real error fails the job.
-        run: terraform plan -input=false -out=tfplan
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        # The plan file stays on the runner. Nothing uploads it.
+        #
+        # stdout is discarded on purpose. `terraform plan` prints the whole diff,
+        # and that text carries attribute values such as the AWS account ID. A
+        # workflow log is world-readable on a public repository, exactly like an
+        # artifact, so the log is not a safe place for it. The redacted summary
+        # in the next step is the published view.
+        #
+        # Failures still appear. Terraform writes diagnostics to stderr.
+        run: terraform plan -input=false -out=tfplan > /dev/null
 
-      - name: Upload Terraform plan
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: terraform-plan-${{ steps.target.outputs.name }}
-          path: terraform/environments/${{ steps.target.outputs.name }}/tfplan
-          if-no-files-found: error
-          retention-days: 7
+      - name: Publish redacted plan summary
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        # This is the plan the reviewer reads before approving the deployment.
+        #
+        # It prints the action verb and the resource address only. It prints no
+        # attribute value, so no account ID, bucket name, or secret reaches the
+        # summary. `terraform show -json` output does hold every value, so
+        # plan.json never leaves this step.
+        #
+        # Caution: a `for_each` key becomes part of a resource address. Never
+        # use a secret as a `for_each` key.
+        run: |
+          terraform show -json tfplan > plan.json
+          {
+            echo "### Terraform plan — ${TF_ENV}"
+            echo
+            echo '| Action | Resource |'
+            echo '|---|---|'
+            jq -r '.resource_changes[]
+                   | select(.change.actions != ["no-op"])
+                   | "| \(.change.actions | join("+")) | `\(.address)` |"' plan.json
+            echo
+            jq -r '[.resource_changes[].change.actions[]]
+                   | group_by(.) | map("\(.[0]): \(length)") | join(", ")' plan.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f plan.json
 
-  apply:
+  deploy:
     name: Terraform Apply
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
-    # `needs` orders the jobs. Apply never starts before the plan succeeds.
-    needs: plan
-    # This environment carries the apply role and the required reviewers.
+    # This environment carries the apply role and the required reviewers. The
+    # approval gates every step below, including the plan.
     environment: ${{ github.ref_name == 'main' && 'production' || 'development' }}
+    env:
+      TF_ENV: ${{ github.ref_name == 'main' && 'production' || 'development' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
-
-      - name: Resolve target environment
-        id: target
-        run: |
-          if [ "${{ github.ref_name }}" = "main" ]; then
-            echo "name=production" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=development" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download Terraform plan
-        uses: actions/download-artifact@v8.0.1
-        with:
-          name: terraform-plan-${{ steps.target.outputs.name }}
-          path: terraform/environments/${{ steps.target.outputs.name }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6.2.3
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           # Environment-scoped secret. The value differs per environment.
           role-to-assume: ${{ secrets.AWS_OIDC_ROLE }}
@@ -108,27 +167,63 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4.0.1
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
       - name: Terraform Init
-        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        working-directory: terraform/environments/${{ env.TF_ENV }}
         run: terraform init -input=false
 
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        # The saved plan feeds the apply step below. The file never leaves this
+        # runner, so it needs no artifact and no bucket.
+        #
+        # stdout is discarded for the same reason as in the plan job: a public
+        # workflow log must not carry the plan text.
+        run: terraform plan -input=false -out=tfplan > /dev/null
+
+      - name: Publish redacted plan summary
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        # Records on the run page what this deployment is about to change.
+        # Compare it against the summary on the pull request.
+        run: |
+          terraform show -json tfplan > plan.json
+          {
+            echo "### Terraform plan — ${TF_ENV}"
+            echo
+            echo '| Action | Resource |'
+            echo '|---|---|'
+            jq -r '.resource_changes[]
+                   | select(.change.actions != ["no-op"])
+                   | "| \(.change.actions | join("+")) | `\(.address)` |"' plan.json
+            echo
+            jq -r '[.resource_changes[].change.actions[]]
+                   | group_by(.) | map("\(.[0]): \(length)") | join(", ")' plan.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f plan.json
+
       - name: Terraform Apply saved plan
-        working-directory: terraform/environments/${{ steps.target.outputs.name }}
-        run: terraform apply -input=false tfplan
+        working-directory: terraform/environments/${{ env.TF_ENV }}
+        # stdout lists every resource with its attribute values. The redacted
+        # summary above already records what this step changes.
+        run: terraform apply -input=false tfplan > /dev/null
 
       - name: Deploy site content to S3
-        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        working-directory: terraform/environments/${{ env.TF_ENV }}
         run: |
           BUCKET=$(terraform output -raw site_bucket_name)
-          aws s3 sync ../../../site "s3://${BUCKET}" --delete
+          # The bucket name embeds the AWS account ID, and `aws s3 sync` prints
+          # the full s3:// URI for every object it copies. `--only-show-errors`
+          # keeps that out of the public log without hiding a real failure.
+          aws s3 sync ../../../site "s3://${BUCKET}" --delete --only-show-errors
 
       - name: Invalidate CloudFront cache
-        working-directory: terraform/environments/${{ steps.target.outputs.name }}
+        working-directory: terraform/environments/${{ env.TF_ENV }}
         run: |
           DIST_ID=$(terraform output -raw cloudfront_distribution_id)
-          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*"
+          # Print the status only. The full response echoes the distribution ID.
+          aws cloudfront create-invalidation --distribution-id "$DIST_ID" \
+            --paths "/*" --query 'Invalidation.Status' --output text

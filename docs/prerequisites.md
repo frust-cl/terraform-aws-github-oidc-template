@@ -27,9 +27,69 @@ Create an OIDC identity provider in your AWS account that trusts GitHub Actions.
 
 Create one IAM role per environment. The pipeline reads the role ARN from a single secret named `AWS_OIDC_ROLE`, and GitHub resolves that name to a different value depending on which of the four environments the job runs under (see step 5). Each role trusts only a specific branch of your repository.
 
+### Choose the correct subject claim format
+
+The `sub` claim identifies the workflow to AWS. Two formats exist. Your trust policy must match the format your repository produces. A mismatch blocks every role assumption.
+
+| Format | Example |
+|---|---|
+| Legacy (name based) | `repo:frust-cl/terraform-aws-github-oidc-template:ref:refs/heads/main` |
+| Immutable (ID based) | `repo:frust-cl@121528376/terraform-aws-github-oidc-template@1346315965:ref:refs/heads/main` |
+
+The legacy format holds only the organisation name and the repository name. Both names are mutable. GitHub releases an organisation name after an organisation deletion. Another owner can then register that name and create a repository with the same name. That repository produces the same `sub` value, and it can assume your IAM role. A repository rename or a repository transfer creates the same class of problem in reverse: the old `sub` value stops matching, and the pipeline fails.
+
+The immutable format adds the numeric organisation ID and the numeric repository ID. Both IDs stay constant for the life of the resource. No other account can reproduce them. Use the immutable format.
+
+GitHub applies the immutable format by default to repositories created after 15 July 2026. Older repositories keep the legacy format until you opt in. GitHub Enterprise Server does not support the immutable format.
+
+**Step 1: read the format your repository uses.**
+
+```bash
+gh api repos/<YOUR_REPOSITORY>/actions/oidc/customization/sub
+```
+
+The response reports the current state and the immutable prefix:
+
+```json
+{
+  "use_default": true,
+  "use_immutable_subject": false,
+  "sub_claim_prefix": "repo:frust-cl@121528376/terraform-aws-github-oidc-template@1346315965"
+}
+```
+
+- `use_immutable_subject: false` means your tokens carry the legacy format today.
+- `use_immutable_subject: true` means your tokens carry the immutable format today.
+- `sub_claim_prefix` always shows the immutable prefix. Append the ref segment to build the full subject.
+
+**Step 2: migrate without an outage.** Follow this order. A single-step change breaks the running pipeline.
+
+1. Add both subject values to the trust policy. An IAM condition accepts an array of strings, and the role matches either value.
+2. Opt in to the immutable format.
+3. Run the pipeline once and confirm that the role assumption succeeds.
+4. Remove the legacy subject value from the trust policy.
+
+Opt in for one repository:
+
+```bash
+gh api --method PUT repos/<YOUR_REPOSITORY>/actions/oidc/customization/sub \
+  -F use_default=true -F use_immutable_subject=true
+```
+
+An organisation admin can opt in for every repository in the organisation:
+
+```bash
+gh api --method PUT orgs/<YOUR_ORGANISATION>/actions/oidc/customization/sub \
+  -F use_immutable_subject=true
+```
+
+Reference: [Immutable subject claims](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims)
+
 ### Production Role
 
 Create a role with the following trust policy. This role allows GitHub Actions to assume it only from the `main` branch of your repository.
+
+The `sub` array holds the immutable value first and the legacy value second. Delete the legacy value after you complete the migration above.
 
 ```json
 {
@@ -46,7 +106,10 @@ Create a role with the following trust policy. This role allows GitHub Actions t
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:revi-cl/terraform-aws-github-oidc-template:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": [
+            "repo:frust-cl@121528376/terraform-aws-github-oidc-template@1346315965:ref:refs/heads/main",
+            "repo:frust-cl/terraform-aws-github-oidc-template:ref:refs/heads/main"
+          ]
         }
       }
     }
@@ -60,6 +123,8 @@ The resulting role ARN replaces `<YOUR_PRODUCTION_ROLE_ARN>` in the pipeline con
 
 Create a role with the following trust policy. This role allows GitHub Actions to assume it only from the `develop` branch of your repository.
 
+The `sub` array holds the immutable value first and the legacy value second. Delete the legacy value after you complete the migration above.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -75,7 +140,10 @@ Create a role with the following trust policy. This role allows GitHub Actions t
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:revi-cl/terraform-aws-github-oidc-template:ref:refs/heads/develop"
+          "token.actions.githubusercontent.com:sub": [
+            "repo:frust-cl@121528376/terraform-aws-github-oidc-template@1346315965:ref:refs/heads/develop",
+            "repo:frust-cl/terraform-aws-github-oidc-template:ref:refs/heads/develop"
+          ]
         }
       }
     }
@@ -149,7 +217,9 @@ After you complete the steps above:
 | `<YOUR_STATE_BUCKET_PRODUCTION>` | S3 bucket for production state |
 | `<YOUR_STATE_BUCKET_DEVELOPMENT>` | S3 bucket for development state |
 | `<YOUR_AWS_REGION>` | AWS region. Both environments deploy to the same region by default |
-| `revi-cl/terraform-aws-github-oidc-template` | GitHub repository (e.g., `org/repo`) |
+| `frust-cl/terraform-aws-github-oidc-template` | GitHub repository (e.g., `org/repo`) |
+| `121528376` | GitHub organisation ID. Read it with `gh api orgs/<ORG> --jq .id` |
+| `1346315965` | GitHub repository ID. Read it with `gh api repos/<ORG>/<REPO> --jq .id` |
 
 ## References
 
@@ -197,6 +267,15 @@ Add every secret from the table above to all four environments.
 
 The plan job runs first. The apply job declares `needs: plan`, so it never starts
 before the plan succeeds. The reviewer reads the plan, then approves the apply.
+
+**Plan limitation for required reviewers.** A required reviewer is a deployment
+protection rule. On the GitHub Free, Pro, and Team plans, protection rules work
+only in public repositories. The setting is unavailable on a private repository
+under those plans, and the REST API returns HTTP 422 with a billing plan message.
+Make the repository public, or move to GitHub Enterprise. A deployment branch
+policy carries no such limit and works on every plan.
+
+Reference: [Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments)
 
 **Fork limitation:** a pull request from a fork receives no secrets and no
 `id-token: write` permission. The plan job cannot run for fork pull requests.
